@@ -1,0 +1,154 @@
+---
+title: "05_sample_submission_form"
+format: html
+---
+
+```{r}
+library(here)
+library(tidyverse)
+library(readxl)
+```
+
+This script is for making a sample submission form for the library for Genewiz.
+
+First, pull in the i5 and i7 information specific to your library. The file below has the i5 and i7 names and sequences that Genewiz will need for demultiplexing.
+
+```{r}
+index_data <- readxl::read_xlsx(here::here("data","raw","sample_submission_form_template.xlsx"), sheet = 2, skip = 1) %>%
+  janitor::clean_names() %>%
+  select(i7_index_name, i7_index_sequence,i5_index_name,i5_index_sequence) 
+
+i7_indexes <- index_data %>%
+  select(i7_index_name, i7_index_sequence) %>%
+  distinct()
+  
+i7_indexes %>%
+  count() 
+
+i5_indexes <- index_data %>%
+  select(i5_index_name, i5_index_sequence) %>%
+  distinct()
+
+i5_indexes %>%
+  count() 
+```
+
+Next, import the lib prep file after it has been filled out by the lab team.  An example is provided below. 
+
+```{r}
+file <- here::here("data","raw","example_lib_prep_completed.xlsx")
+
+data <- excel_sheets(file) %>%
+  set_names() %>%
+  map(~ read_xlsx(file, sheet = .x))
+```
+
+```{r}
+combined <- bind_rows(data[as.character(1:20)])
+```
+
+Filter out the rows with NA (which would be the PCR blanks)
+
+```{r}
+comb_filt <- combined %>%
+  filter(!is.na(ind_id))
+```
+
+Add a sample_num 
+
+```{r}
+info <- comb_filt %>% 
+  mutate(sample_num = row_number())
+```
+
+Ok, need to change the CVTRIV to have the 25 after CV [won't be the case for your data]
+
+```{r}
+info <- info %>%
+  mutate(ind_id = case_when(
+    grepl("CVTRIV", ind_id) ~ sub("^CV", "CV25", ind_id), 
+    TRUE ~ ind_id
+  ))
+```
+
+```{r}
+info <- info %>%
+  mutate(pool_name = "cvir-run014")
+```
+
+```{r}
+info <- info %>%
+  mutate(plate = case_when(
+    extr_plate < 10 ~ as.character(str_pad(extr_plate,2,"left","0")), 
+    extr_plate == 10 ~ as.character(extr_plate),
+    extr_plate > 10 ~ as.character(extr_plate)
+  )) %>%
+  mutate(geno_id = paste(ind_id, plate, extr_well, sep = "-")) %>%
+  mutate(geno_id = str_replace_all(geno_id, "_","-")) 
+
+# Check if they are all correct format 
+
+info %>%
+  select(geno_id) %>%
+  mutate(valid = str_detect(geno_id,
+                            "^CV[0-9]{2}[A-Z]{4}-[0-9]{5}-[0-9]{2}-[A-H][0-9]{2}$")) %>%
+  summarise(all_valid = all(valid))
+
+# If false, find which ones failed
+info %>%
+  select(geno_id) %>%
+  mutate(valid = str_detect(geno_id,
+                            "^CV[0-9]{2}[A-Z]{4}-[0-9]{5}-[0-9]{2}-[A-H][0-9]{2}$")) %>%
+  arrange(valid) %>%
+  filter(valid == FALSE)
+```
+
+```{r}
+info <- info %>%
+  mutate(i7_index_name = paste0("GTseq-i7-i", str_pad(i7, 2, pad = "0")))
+```
+
+```{r}
+info <- info %>%
+  left_join(i7_indexes, by = "i7_index_name")
+```
+
+```{r}
+info <- info %>%
+    mutate(i5_index_name = paste0("GTseq-i5-i", str_pad(i5, 2, pad = "0"),"-IR1"))
+```
+
+```{r}
+info <- info %>%
+  left_join(i5_indexes, by = "i5_index_name")
+```
+
+We need to reverse complement all of our i5s!
+
+```{r}
+info <- info %>%
+  mutate(
+    i5_rev = as.character(
+      Biostrings::reverseComplement(Biostrings::DNAStringSet(i5_index_sequence))
+    )
+  )
+
+info %>%
+  select(i5_index_sequence,i5_rev)
+```
+
+```{r}
+info <- info %>%
+  select(-i5_index_sequence) %>%
+  rename(i5_index_sequence = i5_rev)
+```
+
+```{r}
+final <- info %>%
+  select(sample_num, pool_name, geno_id, i7_index_name,i7_index_sequence,i5_index_name,i5_index_sequence)
+```
+
+```{r}
+write_csv(final, here::here("data","derived","example_sample_submission_data.csv"))
+```
+

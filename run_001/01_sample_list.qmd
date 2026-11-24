@@ -1,0 +1,37 @@
+---
+title: "01_sample_list"
+format: html
+---
+
+```{r}
+library(here)
+library(tidyverse)
+```
+
+
+Produce a tibble of your samples with the following columns of metadata:
+
+- ind_id: ID specific to the individual associated with your sample
+- tube_id: ID specific to the sample (we always use tubes so we call it tube_id)
+- project_id: ID specific to the project associated with each sample
+- ploidy: ploidy of the individual associated with your sample
+- sample_descr: short description of sample, typically used for grouping (e.g., NORA_candidates)
+- sample_type: tissue or swab
+- extr_method: extraction method; chelex or magbind 
+- plate_num: leave NA for now as this will be assigned later 
+- note: leave NA for now as this will be filled out by lab team
+
+Save the tibble as a .rds file in the data/derived folder.
+
+Using some example data in data/raw for demonstration.
+
+```{r}
+data <- read_rds(here::here("data","raw","example_sample_data.rds"))
+```
+
+For example:
+
+```{r, eval = FALSE}
+write_rds(data, here::here("data","derived","run_001_sample_list.rds"))
+```
+

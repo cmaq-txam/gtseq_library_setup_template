@@ -1,0 +1,36 @@
+---
+title: "02_plate_assignments"
+format: html
+---
+
+```{r}
+library(here)
+library(tidyverse)
+```
+
+
+# Import list of samples
+
+```{r}
+data <- read_rds(here::here("data","derived","run_001_sample_list.rds"))
+```
+
+# Assign plates
+
+94 samples are assigned per plate to allow for a PCR1 blank and a PCR2 blank per plate. Note samples are assigned to plates based on their order in the sample_list.
+
+```{r}
+# this is just for example, don't need to do this normally because it would be done already
+plates <- data %>%
+    #arrange(project_id) %>%
+    mutate(
+    plate_num = ((row_number() - 1) %/% 94) + 1
+  ) %>% 
+  select(ind_id, tube_id, project_id, ploidy, sample_descr, sample_type, extr_method, plate_num, note) 
+```
+
+# Save plate assignments
+
+```{r}
+write_rds(plates, here::here("data","derived","run_001_plate_assignments.rds"))
+```

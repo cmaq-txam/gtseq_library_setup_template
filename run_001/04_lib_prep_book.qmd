@@ -1,0 +1,343 @@
+---
+title: "04_lib_prep_book"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(openxlsx)
+```
+
+```{r}
+sample_list <- read_rds(here::here("data","derived","run_001_sample_list.rds"))
+plate_assignments <- read_rds(here::here("data","derived","run_001_plate_assignments.rds"))
+```
+
+# Prep data for lib_prep_book 
+
+## Prep overview
+
+```{r, overview cols}
+overview_cols <- c(
+  "plate_num","num_samples","sample_descr","project_id","sample_type", "status",
+  "extr_method","extractor","PCR_1er","pmix","pmix_nM","PCR_2er","i7"
+)
+```
+
+```{r}
+overview_sheet <- plate_assignments %>%
+  group_by(plate_num) %>%
+  summarise(
+    num_samples = n(),
+    project_id  = paste(sort(unique(project_id)), collapse = ", "),
+    sample_type = paste(sort(unique(sample_type)), collapse = ", "),
+    extr_method = paste(sort(unique(extr_method)), collapse = ", "),
+    sample_descr = paste(sort(unique(sample_descr)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  mutate(status = NA) %>%
+  mutate(extractor = NA) %>%
+  mutate(PCR1_er = NA) %>%
+  mutate(pmix = "pmix_004") %>%
+  mutate(pmix_nM = case_when(
+    extr_method == "chelex" ~ "80nM",
+    extr_method == "magbind" ~ "40nM",
+    TRUE ~ NA
+  )) %>%
+  mutate(PCR2_er = NA) %>%
+  mutate(i7 = as.character(row_number())) %>%
+  mutate(i7 = case_when(
+    i7 == "25" ~ "misc", 
+    TRUE ~ i7
+  ))
+```
+
+## Prep quant
+
+```{r}
+quant_cols <- c(
+  "plate_num","well_id","sample_type",
+  "extr_quant","extr_dil_rate","extr_dil_quant","extr_dna_added","extr_h20_added",
+  "pcr1_quant","pcr1_dil_rate","pcr1_dil_quant","pcr1_dna_added","pcr1_h20_added",
+  "pcr2_quant"
+)
+```
+
+```{r}
+build_quant <- function(quant_input) {
+  stopifnot(all(c("plate_num","well_id","sample_type") %in% names(quant_input)))
+
+  quant <- quant_input %>%
+    mutate(
+      extr_quant = NA,
+      extr_dil_rate = NA,
+      extr_dil_quant = NA,
+      extr_dna_added = NA,
+      extr_h20_added = NA,
+      pcr1_quant = NA,
+      pcr1_dil_rate = NA,
+      pcr1_dil_quant = NA,
+      pcr1_dna_added = NA,
+      pcr1_h20_added = NA,
+      pcr2_quant = NA
+    ) %>%
+    mutate(
+      across(
+        c(extr_dil_rate, extr_dil_quant, extr_dna_added, extr_h20_added),
+        ~ if_else(sample_type == "swab","NA", .)
+      )
+    )
+
+  # Order columns (with disambiguated h2o columns)
+  quant %>%
+    select(
+      plate_num, sample_type, well_id,
+      extr_quant, extr_dil_rate, extr_dil_quant, extr_dna_added, extr_h20_added,
+      pcr1_quant, pcr1_dil_rate, pcr1_dil_quant, pcr1_dna_added, pcr1_h20_added,
+      pcr2_quant
+    )
+}
+```
+
+```{r}
+quant_input <- overview_sheet %>%
+  select(plate_num, sample_type) %>%
+  mutate(col_num = ((plate_num - 1) %% 10) + 1) %>%
+  tidyr::expand_grid(row_letter = LETTERS[1:8]) %>%
+  mutate(
+    well = str_c(row_letter, str_pad(col_num, width = 2, pad = "0")),
+    well_order = match(row_letter, LETTERS[1:8])  # A=1 ... H=8
+  ) %>%
+  select(plate_num, sample_type, well, well_order) %>%
+  bind_rows(
+    overview_sheet %>%
+      select(plate_num, sample_type) %>%
+      tidyr::expand_grid(well = c("H11", "H12")) %>%
+      mutate(well_order = if_else(well == "H11", 9L, 10L)) %>%
+      select(plate_num, sample_type, well, well_order)
+  ) %>%
+  arrange(plate_num, well_order) %>%
+  select(-well_order) %>%
+  rename(well_id = well)
+
+quant_sheet <- build_quant(quant_input)
+```
+
+Small tweaks to quant sheet
+
+```{r}
+quant_sheet <- quant_sheet %>%
+  mutate(extr_quant = case_when(
+    well_id == "H11" | well_id == "H12" ~ "NA",
+    TRUE ~ extr_quant
+  )) %>%
+  mutate(
+      across(
+        c(pcr1_quant,pcr1_dil_rate,pcr1_dil_quant,pcr1_dna_added,pcr1_h20_added),
+        ~ if_else(well_id == "H12","NA", .)
+      )
+    )
+```
+
+## Prep plate sheets
+
+```{r}
+plate_cols <- c(
+  "ind_id","tube_id","project_id","sample_descr","sample_type",
+  "extr_method", "extr_plate","extr_well",
+  "pmix", "pmix_nM","PCR1_well", "PCR1_dilut_well","PCR2_well",
+  "i5","i7","pool"
+)
+```
+
+```{r}
+# All 96 wells in your preferred order (A1..A12, B1..B12, ... H12)
+wells_96 <- as.vector(
+  t(
+    outer(
+      LETTERS[1:8],
+      str_pad(1:12, width = 2, pad = "0"),
+      paste0
+    )
+  )
+)
+
+# Use 94 wells, reserving H11/H12 for the blank control rows
+wells_94 <- setdiff(wells_96, c("H11", "H12"))
+```
+
+```{r}
+plate_sheet <- plate_assignments %>%
+  mutate(
+    sample_descr = NA_character_,
+    extr_plate   = plate_num
+  ) %>%
+  group_by(plate_num) %>%
+  mutate(extr_well = wells_94[row_number()]) %>%
+  ungroup()
+
+# Two control rows per plate
+control_rows <- plate_sheet %>%
+  distinct(plate_num) %>%
+  tidyr::expand_grid(extr_well = c("H11", "H12")) %>%
+  mutate(extr_plate = plate_num)
+
+# Add ALL missing columns as NA, then match column order
+missing_cols <- setdiff(names(plate_sheet), names(control_rows))
+
+control_rows <- control_rows %>%
+  mutate(!!!set_names(rep(list(NA), length(missing_cols)), missing_cols)) %>%
+  select(all_of(names(plate_sheet)))
+
+# Bind and order so controls are last within each plate
+plate_sheet <- plate_sheet %>%
+  bind_rows(control_rows) %>%
+  arrange(
+    plate_num,
+    factor(extr_well, levels = c(wells_94, "H11", "H12"))
+  )
+
+plate_sheet <- plate_sheet %>%
+  group_by(plate_num) %>%
+  mutate(i5 = row_number()) %>%
+  ungroup() %>%
+  mutate(i7 = case_when(
+    plate_num == 25 ~ NA, 
+    TRUE ~ as.character(plate_num)
+  )) %>%
+  mutate(pool = 4)
+
+plate_sheet %>%
+  select(extr_well)
+```
+
+```{r}
+ensure_cols <- function(df, cols) {
+  missing <- setdiff(cols, names(df))
+  if (length(missing) > 0) df[missing] <- NA
+  df %>% select(all_of(cols))
+}
+```
+
+```{r}
+make_workbook <- function(overview_sheet, quant_sheet, plate_sheet,
+                          out_file = "workbook.xlsx", n_plates = 25) {
+
+  # --- Overview ---
+  overview <- overview_sheet %>% ensure_cols(overview_cols)
+
+  # --- Quant ---
+  quant <- quant_sheet
+
+  # --- Plate sheets ---
+  plates_tbl <- plate_sheet
+  stopifnot("plate_num" %in% names(plates_tbl))
+  plates_tbl <- plates_tbl %>% ensure_cols(c("plate_num", plate_cols))
+
+  wb <- createWorkbook()
+
+  # Styles
+  style_center <- createStyle(halign = "center", valign = "center")
+  style_left   <- createStyle(halign = "left",   valign = "center")
+
+  # Helper: apply alignment rules to a sheet
+  apply_alignment <- function(wb, sheet, df, include_header = TRUE) {
+    cn <- names(df)
+    n_rows <- nrow(df)
+    if (n_rows == 0) n_rows <- 1  # so templates still get styled
+
+    # Excel rows: header is row 1
+    rows_to_style <- if (include_header) 1:(n_rows + 1) else 2:(n_rows + 1)
+
+    # Column indices by name (if present)
+    plate_col <- which(cn == "plate_num")
+    left_cols <- which(cn %in% c("ind_id", "tube_id"))
+    center_cols <- setdiff(seq_along(cn), left_cols)
+
+    # Force plate_num to be centered (already included in center_cols, but explicit is fine)
+    # Apply center everywhere except ind_id/sample_id
+    addStyle(wb, sheet, style_center,
+             rows = rows_to_style, cols = center_cols,
+             gridExpand = TRUE, stack = TRUE)
+
+    # Apply left to ind_id/sample_id
+    if (length(left_cols) > 0) {
+      addStyle(wb, sheet, style_left,
+               rows = rows_to_style, cols = left_cols,
+               gridExpand = TRUE, stack = TRUE)
+    }
+
+    invisible(NULL)
+  }
+
+  # -------------------------
+  # Sheet 1: Overview
+  # -------------------------
+  addWorksheet(wb, "Overview")
+  writeData(wb, "Overview", overview, colNames = TRUE)
+  freezePane(wb, "Overview", firstRow = TRUE)
+  setColWidths(wb, "Overview", cols = 1:ncol(overview), widths = "auto")
+  apply_alignment(wb, "Overview", overview, include_header = TRUE)
+
+  # -------------------------
+  # Sheet 2: Quant
+  # -------------------------
+addWorksheet(wb, "Quant")
+writeData(wb, "Quant", quant, colNames = TRUE)
+freezePane(wb, "Quant", firstRow = TRUE)
+setColWidths(wb, "Quant", cols = 1:ncol(quant), widths = "auto")
+apply_alignment(wb, "Quant", quant, include_header = TRUE)
+
+# --- Add thick line after each plate (after H12 row) ---
+thick_bottom <- createStyle(border = "Bottom", borderStyle = "thick")
+
+# Make sure quant has well_id and is ordered by plate then well
+stopifnot("well_id" %in% names(quant))
+quant <- quant %>% arrange(plate_num, well_id)
+
+# rows (in quant data) where a plate ends (H12)
+end_rows <- which(quant$well_id == "H12")
+
+# If your wells are padded like "H12" but others are "H01" etc, this is still fine.
+# Convert to Excel row indices: +1 because row 1 is the header row in Excel
+end_rows_excel <- end_rows + 1
+
+# Apply thick bottom border across all columns on those rows
+addStyle(
+  wb, "Quant", thick_bottom,
+  rows = end_rows_excel,
+  cols = 1:ncol(quant),
+  gridExpand = TRUE,
+  stack = TRUE
+)
+
+  # -------------------------
+  # Plate sheets 1..n_plates
+  # -------------------------
+  for (p in seq_len(n_plates)) {
+    sh <- as.character(p)   # sheet names should be strings
+    addWorksheet(wb, sh)
+
+    plate_df <- plates_tbl %>%
+      filter(plate_num == p) %>%
+      select(all_of(plate_cols))
+
+    if (nrow(plate_df) == 0) {
+      plate_df <- tibble(!!!set_names(rep(list(NA), length(plate_cols)), plate_cols))[0, ]
+    }
+
+    writeData(wb, sh, plate_df, colNames = TRUE)
+    freezePane(wb, sh, firstRow = TRUE)
+    setColWidths(wb, sh, cols = 1:length(plate_cols), widths = "auto")
+    apply_alignment(wb, sh, plate_df, include_header = TRUE)
+  }
+
+  saveWorkbook(wb, out_file, overwrite = TRUE)
+  invisible(out_file)
+}
+```
+
+```{r}
+make_workbook(overview_sheet,quant_sheet,plate_sheet,out_file = here::here("data","derived","run_001_lib_prep.xlsx"))
+```
+

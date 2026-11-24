@@ -1,0 +1,213 @@
+---
+title: "03_extraction_workbook"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(openxlsx)
+```
+
+# Import plate_assignments
+
+```{r}
+data <- read_rds(here::here("data","derived","run_001_plate_assignments.rds"))
+```
+
+# Make extraction book
+
+This will be an excel file with instructions on which samples to extract into which plates
+
+```{r}
+# ---- Make the 8x12 layout tibble (NO metadata rows) ----
+make_plate_layout <- function(ids_94) {
+  ids_94 <- ids_94 %>%
+    head(94) %>%
+    { c(., rep("", 94 - length(.))) }
+
+  ids_96 <- c(ids_94, "", "")
+
+  mat <- matrix(ids_96, nrow = 8, ncol = 12, byrow = TRUE)
+
+  tibble(Row = LETTERS[1:8]) %>%
+    bind_cols(as_tibble(mat) %>% set_names(as.character(1:12)))
+}
+```
+
+```{r}
+make_all_plate_layouts <- function(data) {
+  stopifnot(all(c("tube_id", "plate_num", "project_id") %in% names(data)))
+
+  data %>%
+    arrange(plate_num) %>%
+    group_by(plate_num) %>%
+    summarise(
+      project_id = paste(sort(unique(na.omit(project_id))), collapse = ", "),
+      ids = list(tube_id),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      plate_tbl = pmap(
+        list(ids, plate_num, project_id),
+        function(ids_94, plate_num, project_id) {
+
+          plate_id <- paste0("plate_", plate_num)
+
+          # two metadata rows (plate + project) in the "Row" column
+          header_rows <- tibble(Row = c(plate_id, project_id)) %>%
+            bind_cols(
+              as_tibble(matrix("", nrow = 2, ncol = 12)) %>%
+                set_names(as.character(1:12))
+            )
+
+          # NEW: a row that contains the 1..12 labels as cell values
+          col_label_row <- tibble(Row = "") %>%
+            bind_cols(
+              as_tibble(matrix(as.character(1:12), nrow = 1)) %>%
+                set_names(as.character(1:12))
+            )
+
+          bind_rows(
+            header_rows,
+            col_label_row,              # <-- labels now sit right above A row
+            make_plate_layout(ids_94),  # A-H rows with IDs
+            tibble(Row = "", !!!set_names(rep(list(""), 12), as.character(1:12)))
+          )
+        }
+      )
+    ) %>%
+    select(plate_tbl) %>%
+    unnest(plate_tbl)
+}
+```
+
+```{r}
+layout <- make_all_plate_layouts(data)
+```
+
+# Name of file to produce
+
+```{r}
+file_name <- "run_001_extraction_sheet.xlsx"
+```
+
+```{r}
+# Helper: Excel sheet name helper (max 31 chars, no []:*?/\, unique)
+sanitize_sheet_name <- function(x) {
+  x <- as.character(x)
+  x <- gsub("[\\[\\]\\:\\*\\?\\/\\\\]", "_", x)
+  x <- trimws(x)
+  ifelse(nchar(x) > 31, substr(x, 1, 31), x)
+}
+
+stopifnot("project_id" %in% names(data))
+
+# -------------------------
+# Build workbook fresh each run
+# -------------------------
+wb <- createWorkbook()
+
+# -------------------------
+# Sheet 1: Plates (layout + formatting)
+# -------------------------
+addWorksheet(wb, "Plates")
+
+# Write stacked layout
+writeData(wb, "Plates", layout, startRow = 1, startCol = 1, colNames = FALSE)
+
+# Column widths (nice for plate viewing)
+setColWidths(wb, "Plates", cols = 1, widths = 10)     # Row / metadata col
+setColWidths(wb, "Plates", cols = 2:13, widths = 18)  # wells
+
+# Styles
+grid_style <- createStyle(
+  border = "TopBottomLeftRight",
+  borderStyle = "thin",
+  halign = "center",
+  valign = "center"
+)
+
+label_style <- createStyle(
+  fgFill = "#D9D9D9",
+  border = "TopBottomLeftRight",
+  borderStyle = "thin",
+  halign = "center",
+  valign = "center",
+  textDecoration = "bold"
+)
+
+meta_style <- createStyle(textDecoration = "bold")
+
+# Find each plate’s label row (the row with "1" in column "1")
+# This assumes you built layout with an explicit 1..12 label row per plate:
+# Row == "" and column `1` == "1"
+label_rows <- which(layout$Row == "" & layout$`1` == "1")
+if (length(label_rows) == 0) {
+  stop("Couldn't find any plate label rows. Expected rows where Row=='' and column '1' == '1'.")
+}
+
+# Apply styles for each plate block
+for (label_top in label_rows) {
+
+  # label row + A..H = 9 rows; columns Row + 12 wells = 13 cols
+  grid_rows <- label_top:(label_top + 8)
+  grid_cols <- 1:13
+
+  # Borders around every cell in the plate grid
+  addStyle(wb, "Plates", grid_style,
+           rows = grid_rows, cols = grid_cols,
+           gridExpand = TRUE, stack = TRUE)
+
+  # Gray fill on the label row ("" + 1..12)
+  addStyle(wb, "Plates", label_style,
+           rows = label_top, cols = grid_cols,
+           gridExpand = TRUE, stack = TRUE)
+
+  # Gray fill on the first column (Row labels A..H + top-left)
+  addStyle(wb, "Plates", label_style,
+           rows = grid_rows, cols = 1,
+           gridExpand = TRUE, stack = TRUE)
+
+  # Bold the two metadata lines above the label row (plate_id, project_id)
+  addStyle(wb, "Plates", meta_style,
+           rows = (label_top - 2):(label_top - 1), cols = 1,
+           gridExpand = TRUE, stack = TRUE)
+}
+
+# Optional: freeze the first column so row letters/metadata stay visible while scrolling
+freezePane(wb, "Plates", firstCol = TRUE)
+
+# -------------------------
+# Additional sheets: one per project_id (raw rows)
+# -------------------------
+project_vals <- data %>%
+  distinct(project_id) %>%
+  pull(project_id)
+
+sheet_names <- project_vals %>%
+  sanitize_sheet_name() %>%
+  make.unique(sep = "_")
+
+for (i in seq_along(project_vals)) {
+  pid <- project_vals[i]
+  sh  <- sheet_names[i]
+
+  df_proj <- data %>% filter(project_id == pid)
+
+  addWorksheet(wb, sh)
+  writeData(wb, sh, df_proj, startRow = 1, startCol = 1, colNames = TRUE)
+
+  freezePane(wb, sh, firstRow = TRUE)
+  setColWidths(wb, sh, cols = 1:ncol(df_proj), widths = "auto")
+}
+
+# -------------------------
+# Save workbook
+# -------------------------
+saveWorkbook(wb, here::here("data","derived",file_name), overwrite = TRUE)
+```
+
+```{r}
+
+```
+
